@@ -1,0 +1,45 @@
+# Official Airflow image + Java + PySpark + S3A/JDBC jars baked in at build time
+FROM apache/airflow:2.9.1-python3.10
+
+# Mirrors can be overridden at build time (see docker-compose.yml / README in chat)
+ARG APT_MIRROR=deb.debian.org
+ARG MAVEN_MIRROR=https://repo1.maven.org/maven2
+
+USER root
+RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$f" ]; then \
+            sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f"; \
+        fi; \
+    done \
+    && if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's/ bookworm-updates//' /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && if [ -f /etc/apt/sources.list ]; then \
+        sed -i '/bookworm-updates/d' /etc/apt/sources.list; \
+    fi \
+    # third-party apt repos (docker, postgres, mariadb, microsoft) are not needed here
+    && find /etc/apt/sources.list.d -type f ! -name 'debian.sources' -delete \
+    && apt-get -o Acquire::Retries=5 update \
+    # curl is already in the Airflow image. Retry install: already-downloaded .debs stay cached,
+    # so a flaky 502 on a single package only re-fetches that package.
+    && (for i in 1 2 3 4 5 6; do \
+          apt-get -o Acquire::Retries=5 install -y --no-install-recommends --fix-missing openjdk-17-jre-headless && exit 0; \
+          echo "apt install failed, retry $i"; sleep 5; \
+        done; exit 1) \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(dirname "$(dirname "$(readlink -f "$(which java)")")")" /opt/java
+ENV JAVA_HOME=/opt/java
+
+USER airflow
+# boto3 and psycopg2 already ship with the official image (amazon/postgres providers)
+RUN pip install --no-cache-dir --retries 10 pyspark==3.5.1
+
+# hadoop-aws 3.3.4 matches the Hadoop client bundled with pyspark 3.5.1
+RUN SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirname(pyspark.__file__),"jars"))')" \
+    && cd "$SPARK_JARS" \
+    && for p in \
+        org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
+        com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \
+        org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar; do \
+        curl -fSL --retry 8 --retry-delay 3 --retry-all-errors -O "${MAVEN_MIRROR}/${p}"; \
+    done
